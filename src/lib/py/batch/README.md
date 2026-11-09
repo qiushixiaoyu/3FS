@@ -71,3 +71,19 @@ failure draining using a deterministic API double; `run_batch_tests.py`
 builds that double with ASAN/UBSAN. `test_batch_io_cluster.py` is an explicit
 real-cluster smoke test using a caller-provided scratch file. Neither test
 loads a model or allocates GPU memory.
+
+## Optional padded full pages
+
+`Batch(path, physical_file_size, io_bytes, depth, read, payload_size=0)` retains
+legacy byte-range behavior when `payload_size` is zero. A positive payload size
+requires every buffer to have exactly that many bytes and every offset to be
+4 KiB aligned. `io_bytes` must be the payload rounded up to 4 KiB. Writes zero
+only the padding in owned staging memory; reads copy only the logical payload.
+Only a completion of exactly `io_bytes` returns `payload_size`; every positive
+short completion returns `-EIO` and does not modify a read destination.
+
+The caller owns slot-offset translation, file naming and metadata isolation.
+For a 224,640-byte payload, use `io_bytes=225280` and offsets spaced by 262144
+to keep each operation within a 1 MiB chunk. Never apply this mapping to an
+existing packed file. The completion still waits for the existing 3FS replica
+protocol; this option does not change storage-server durability settings.
