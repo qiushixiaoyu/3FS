@@ -107,6 +107,51 @@ class BatchTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self.reader.io([0], native.Buffers([bytearray(64)]))
 
+    def test_padded_pages_zero_tail_and_reopen(self):
+        path = self.path + ".padded"
+        payload, io_bytes, stride = 224640, 225280, 262144
+        offsets = [0, stride, 4 * stride]  # includes a 1 MiB boundary
+        pages = [bytearray([i + 11] * payload) for i in range(3)]
+        writer = native.Batch(path, 8 * stride, io_bytes, 4, False, payload)
+        try:
+            self.assertEqual(writer.io(offsets, native.Buffers(pages)), [payload] * 3)
+            with open(path, "rb") as f:
+                for off, page in zip(offsets, pages):
+                    f.seek(off)
+                    self.assertEqual(f.read(io_bytes), page + bytes(io_bytes - payload))
+            # Reject the entire invalid batch, including a sub-page write.
+            for offs, bufs in (([0, 1], pages[:2]), ([0], [bytearray(payload-1)]),
+                               ([8 * stride - 4096], pages[:1])):
+                with self.assertRaises(RuntimeError):
+                    writer.io(offs, native.Buffers(bufs))
+        finally:
+            writer.close()
+        reader = native.Batch(path, 8 * stride, io_bytes, 4, True, payload)
+        try:
+            out = [bytearray(payload) for _ in pages]
+            self.assertEqual(reader.io(offsets, native.Buffers(out)), [payload] * 3)
+            self.assertEqual(out, pages)
+            os.environ["TEST_CQE_SHORT"] = str(payload)
+            out = [bytearray([99] * payload) for _ in pages]
+            self.assertTrue(all(r < 0 for r in reader.io(offsets, native.Buffers(out))))
+            self.assertTrue(all(p == bytearray([99] * payload) for p in out))
+        finally:
+            reader.close()
+
+    def test_padded_failed_submission_can_retry(self):
+        path = self.path + ".padded"
+        ring = native.Batch(path, 32768, 4096, 4, False, 4000)
+        try:
+            pages = native.Buffers([bytearray(4000)] * 4)
+            for setting in ("TEST_PREP_FAIL", "TEST_SUBMIT_FAIL"):
+                os.environ[setting] = "2"
+                with self.assertRaises(RuntimeError):
+                    ring.io([0, 4096, 8192, 12288], pages)
+                del os.environ[setting]
+                self.assertEqual(ring.io([0, 4096, 8192, 12288], pages), [4000] * 4)
+        finally:
+            ring.close()
+
     def test_existing_file_size_not_changed(self):
         with self.assertRaises(RuntimeError):
             native.Batch(self.path, 8192, 64, 8, True)

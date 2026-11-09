@@ -81,6 +81,7 @@ int hf3fs_wait_for_ios(const hf3fs_ior *r, hf3fs_cqe *cq, int count, int, const 
     auto result = uintptr_t(op.user) == uintptr_t(setting("TEST_CQE_ERROR")) ? -EIO
                   : op.read                                                  ? pread(op.fd, op.ptr, op.size, op.off)
                                                                              : pwrite(op.fd, op.ptr, op.size, op.off);
+    if (setting("TEST_CQE_SHORT") && result > 0) result = setting("TEST_CQE_SHORT");
     cq[n++] = {0, 0, result, op.user};
     if (setting("TEST_WAIT_PARTIAL")) break;
   }

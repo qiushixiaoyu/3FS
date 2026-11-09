@@ -40,7 +40,7 @@ class Batch {
   hf3fs_iov iov{};
   hf3fs_ior ior{};
   int fd = -1, depth;
-  size_t bs, file_size, pending = 0;
+  size_t bs, file_size, payload_size, pending = 0;
   bool read_mode, have_iov = false, have_ior = false, registered = false, closed = false;
   std::mutex mutex;
 
@@ -67,13 +67,16 @@ class Batch {
   }
 
  public:
-  Batch(const std::string &path, size_t size, size_t page_size, int entries, bool read)
+  Batch(const std::string &path, size_t size, size_t page_size, int entries, bool read, size_t payload = 0)
       : depth(entries),
         bs(page_size),
         file_size(size),
+        payload_size(payload),
         read_mode(read) {
     require(depth > 0 && depth <= 4096 && bs > 0 && bs <= SIZE_MAX / depth, "invalid ring dimensions");
     require(size > 0 && size <= size_t(std::numeric_limits<off_t>::max()), "invalid file size");
+    require(!payload_size || (payload_size <= bs && bs % 4096 == 0 && bs - payload_size < 4096),
+            "padded page must be a payload rounded up to 4096 bytes");
     try {
       fd = ::open(path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
       require(fd >= 0, "open failed");
@@ -107,6 +110,8 @@ class Batch {
       require(bytes <= bs && offsets[i] <= file_size && bytes <= file_size - offsets[i],
               "page outside file/buffer bounds");
       require(!read_mode || !v.readonly, "read destination is read-only");
+      require(!payload_size || (bytes == payload_size && offsets[i] % 4096 == 0 &&
+                                bs <= file_size - offsets[i]), "invalid padded full page");
       sizes.push_back(bytes);
     }
     std::vector<int64_t> results(offsets.size(), 0);
@@ -117,7 +122,10 @@ class Batch {
     require(!closed && pending == 0, "closed or undrained client");
     if (offsets.empty()) return results;
     if (!read_mode)
-      for (size_t i = 0; i < offsets.size(); ++i) std::memcpy(iov.base + i * bs, buffers.views[i].ptr, sizes[i]);
+      for (size_t i = 0; i < offsets.size(); ++i) {
+        std::memcpy(iov.base + i * bs, buffers.views[i].ptr, sizes[i]);
+        if (payload_size) std::memset(iov.base + i * bs + payload_size, 0, bs - payload_size);
+      }
     bool prep_error = false, completion_error = false;
     for (size_t i = 0; i < offsets.size(); ++i) {
       int r = hf3fs_prep_io(&ior,
@@ -126,7 +134,7 @@ class Batch {
                             iov.base + i * bs,
                             fd,
                             offsets[i],
-                            sizes[i],
+                            payload_size ? bs : sizes[i],
                             reinterpret_cast<void *>(i + 1));
       if (r < 0) {
         prep_error = true;
@@ -150,7 +158,9 @@ class Batch {
           continue;
         }
         seen[i] = true;
-        results[i] = cqes[j].result;
+        auto result = cqes[j].result;
+        // A short padded completion equal to the logical payload is NOT success.
+        results[i] = payload_size && result >= 0 ? (result == int64_t(bs) ? int64_t(payload_size) : -EIO) : result;
       }
     }
     require(!prep_error && !submit_error && !completion_error, "batch submission/completion error (drained)");
@@ -187,7 +197,9 @@ PYBIND11_MODULE(hf3fs_py_batch, m) {
 #endif
   py::class_<Buffers>(m, "Buffers").def(py::init<const py::list &>());
   py::class_<Batch>(m, "Batch")
-      .def(py::init<const std::string &, size_t, size_t, int, bool>())
+      .def(py::init<const std::string &, size_t, size_t, int, bool, size_t>(),
+           py::arg("path"), py::arg("size"), py::arg("page_size"), py::arg("entries"),
+           py::arg("read"), py::arg("payload_size") = 0)
       .def("io", &Batch::io, py::arg("offsets"), py::arg("buffers"))
       .def("flush", &Batch::flush)
       .def("close", &Batch::close);
