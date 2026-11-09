@@ -12,3 +12,5 @@ target_include_directories(hf3fs_py_usrbio
   )
 target_link_libraries(hf3fs_py_usrbio PRIVATE hf3fs_api_shared)
 
+add_subdirectory(batch)
+
